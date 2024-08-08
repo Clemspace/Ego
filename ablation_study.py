@@ -7,7 +7,10 @@ import json
 from data_utils import ARCDataset, ARCTask
 from utils import get_device, print_cuda_info
 import torch.nn.functional as F
-from ego import AdaptiveModificationScheduler
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from ego import SelfAdaptingModificationScheduler, SelfModifyingNetwork, AdaptiveEarlyStopping
+import copy
+
 
 
 def load_arc_data(challenge_file, solution_file=None):
@@ -48,14 +51,16 @@ def run_ablation_study(model_class, train_dataset, eval_dataset, base_config, fe
     
     return results
 
-
 def train_and_evaluate(model, train_tasks, eval_tasks, epochs):
     device = get_device()
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    scheduler = AdaptiveModificationScheduler()
-  
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    modification_scheduler = SelfAdaptingModificationScheduler(model, initial_frequency=0.1, min_frequency=0.01, max_frequency=0.2)
+    early_stopping = AdaptiveEarlyStopping(patience=20, modification_delay=20)
+
     best_eval_loss = float('inf')
+    best_model = None
     
     for epoch in range(epochs):
         model.train()
@@ -80,6 +85,9 @@ def train_and_evaluate(model, train_tasks, eval_tasks, epochs):
                 
                 loss = torch.nn.functional.cross_entropy(content_pred_flat, output_grid_flat)
                 loss.backward()
+                
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
                 
                 total_train_loss += loss.item()
@@ -87,7 +95,6 @@ def train_and_evaluate(model, train_tasks, eval_tasks, epochs):
         
         avg_train_loss = total_train_loss / num_train_samples if num_train_samples > 0 else float('inf')
         
-        # Evaluation
         model.eval()
         total_eval_loss = 0
         num_eval_samples = 0
@@ -116,44 +123,72 @@ def train_and_evaluate(model, train_tasks, eval_tasks, epochs):
                     correct_predictions += (predicted == output_grid).all().item()
         
         accuracy = correct_predictions / num_eval_samples if num_eval_samples > 0 else 0        
-
-        avg_eval_loss = total_eval_loss / num_eval_samples
-        scheduler.update_frequency(avg_eval_loss)
-
-        if scheduler.should_modify(epoch):
-            modifications = model.modify(avg_eval_loss)
-            if modifications:
-                print(f"Model modifications: {modifications}")
-                scheduler.record_modification(epoch)
+        avg_eval_loss = total_eval_loss / num_eval_samples if num_eval_samples > 0 else float('inf')
         
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Eval Loss: {avg_eval_loss:.4f}, Accuracy: {accuracy:.4f}, Modification Frequency: {scheduler.current_frequency:.4f}")
-            
-        if avg_eval_loss < best_eval_loss:
-            best_eval_loss = avg_eval_loss
+        old_lr = optimizer.param_groups[0]['lr']
+        scheduler.step(avg_eval_loss)
+        new_lr = optimizer.param_groups[0]['lr']
         
-        if hasattr(model, 'modify'):
-            modifications = model.modify(avg_eval_loss)
-            if modifications:
-                print(f"Model modifications: {modifications}")
-                
-        performance = {'final_train_loss': avg_train_loss,
-                        'final_eval_loss': avg_eval_loss,
-                        'best_eval_loss': best_eval_loss,
-                        'final_accuracy': accuracy,
-                        'model_size_mb': model.get_model_size(),
-                        'modification_frequency': scheduler.current_frequency,
-                        'num_modifications': len(model.modification_history) if hasattr(model, 'modification_history') else 0   }     
-                
-        wandb.log({f"{'baseline'}_{k}": v for k, v in performance.items()})
+        modification_scheduler.update(avg_eval_loss)
+        
+        if modification_scheduler.should_modify():
+            modifications = model.modify(avg_train_loss, avg_eval_loss)
+        else:
+            modifications = []
 
+        should_stop, best_model = early_stopping(model, epoch, avg_eval_loss, modifications)
+        
+        stats = modification_scheduler.get_stats()
+        
+        # Terminal logging
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"Train Loss: {avg_train_loss:.4f}, Eval Loss: {avg_eval_loss:.4f}, Accuracy: {accuracy:.4f}")
+        print(f"Modification Frequency: {stats['frequency']:.4f}, Parameters: {stats['parameters']}")
+        print(f"Learning Rate: {new_lr:.6f}")
+        if modifications:
+            print("Modifications made:")
+            for mod in modifications:
+                print(f"- {mod}")
+        if old_lr != new_lr:
+            print(f"Learning rate changed: {old_lr:.6f} -> {new_lr:.6f}")
+        print("-" * 50)
+        
+        # wandb logging
+        wandb.log({
+            'epoch': epoch,
+            'train_loss': avg_train_loss,
+            'eval_loss': avg_eval_loss,
+            'accuracy': accuracy,
+            'modification_frequency': stats['frequency'],
+            'cooldown_period': stats['cooldown'],
+            'modification_threshold': stats['threshold'],
+            'total_modifications': stats['modifications'],
+            'parameter_count': stats['parameters'],
+            'learning_rate': new_lr,
+            'model_size_mb': model.get_model_size(),
+            'num_encoder_layers': len(model.encoder),
+            'num_decoder_layers': len(model.decoder),
+            'current_activation': model.current_activation,
+        })
+        
+        if modifications:
+            wandb.log({f'modification_{i}': mod for i, mod in enumerate(modifications)})
+        
+        if should_stop:
+            print(f"Early stopping triggered after {epoch+1} epochs")
+            break
 
+    # Use the best model for final evaluation
+    model = best_model
+    
     return {
         'final_train_loss': avg_train_loss,
         'final_eval_loss': avg_eval_loss,
         'best_eval_loss': best_eval_loss,
         'final_accuracy': accuracy,
         'model_size_mb': model.get_model_size(),
-        'num_modifications': len(model.modification_history) if hasattr(model, 'modification_history') else 0
+        'num_modifications': stats['modifications'],
+        'final_parameter_count': stats['parameters']
     }
 
 def main():
@@ -178,24 +213,30 @@ def main():
     base_config = {
         'input_channels': 10,  # ARC typically uses values 0-9
         'initial_hidden_channels': [64, 128],
-        'max_size_mb': 500,
+        'max_size_mb': 50,
         'enable_layer_addition': True,
         'enable_activation_modification': True,
         'enable_forward_modification': True
     }
     
-    features_to_ablate =[]#, ['enable_layer_addition', 'enable_activation_modification', 'enable_forward_modification']
+    features_to_ablate = ['enable_layer_addition', 'enable_activation_modification', 'enable_forward_modification']
     
-    wandb.init(project="arc-self-modifying-network-ablation")
-
-    
+    wandb.init(
+        project="arc-self-modifying-network-ablation",
+        config={
+            "initial_hidden_channels": base_config['initial_hidden_channels'],
+            "max_size_mb": base_config['max_size_mb'],
+            "enable_layer_addition": base_config['enable_layer_addition'],
+            "enable_activation_modification": base_config['enable_activation_modification'],
+            "enable_forward_modification": base_config['enable_forward_modification'],
+        }
+    )    
     results = run_ablation_study(SelfModifyingNetwork, train_tasks, eval_tasks, base_config, features_to_ablate)
     
     # Log results to wandb
-    wandb.init(project="arc-self-modifying-network-ablation")
-    for study_name, performance in results.items():
-        wandb.log({f"{study_name}_{k}": v for k, v in performance.items()})
-    wandb.finish()
+    #for study_name, performance in results.items():
+        #wandb.log({f"{study_name}_{k}": v for k, v in performance.items()})
+    #wandb.finish()
 
 if __name__ == "__main__":
     main()
