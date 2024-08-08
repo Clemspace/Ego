@@ -1,3 +1,4 @@
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,7 +38,13 @@ class AdaptiveLRScheduler(_LRScheduler):
         self.cooldown_counter = 0
         self.num_bad_epochs = 0
 
-    def step(self, metrics):
+    def step(self, metrics=None):
+        # Raise warning if no metrics provided
+        if metrics is None:
+            if self.last_epoch != -1:
+                warnings.warn("No metrics provided, AdaptiveLRScheduler cannot adjust learning rate.", UserWarning)
+            return
+
         current = metrics
         self.last_epoch += 1
 
@@ -57,8 +64,6 @@ class AdaptiveLRScheduler(_LRScheduler):
             self.num_bad_epochs = 0
         elif self.num_bad_epochs == 0:
             self._increase_lr(self.last_epoch)
-
-        return self.get_last_lr()
 
     def _reduce_lr(self, epoch):
         for i, param_group in enumerate(self.optimizer.param_groups):
