@@ -6,6 +6,108 @@ import math
 import numpy as np
 from collections import deque
 import copy
+from torch.optim.lr_scheduler import _LRScheduler
+
+class AdaptiveLRScheduler(_LRScheduler):
+    def __init__(self, optimizer, mode='min', factor=0.5, patience=5, threshold=1e-4, 
+                 threshold_mode='rel', cooldown=0, min_lr=1e-8, max_lr=1.0, 
+                 increase_factor=1.5, verbose=False):
+        self.mode = mode
+        self.factor = factor
+        self.patience = patience
+        self.threshold = threshold
+        self.threshold_mode = threshold_mode
+        self.cooldown = cooldown
+        self.min_lr = min_lr
+        self.max_lr = max_lr
+        self.increase_factor = increase_factor
+        self.verbose = verbose
+        
+        self.cooldown_counter = 0
+        self.best = None
+        self.num_bad_epochs = 0
+        self.mode_worse = None  # the worse value for the chosen mode
+        self.last_epoch = 0
+        self._init_is_better(mode=mode, threshold=threshold, threshold_mode=threshold_mode)
+        self._reset()
+        super(AdaptiveLRScheduler, self).__init__(optimizer)
+
+    def _reset(self):
+        self.best = self.mode_worse
+        self.cooldown_counter = 0
+        self.num_bad_epochs = 0
+
+    def step(self, metrics):
+        current = metrics
+        self.last_epoch += 1
+
+        if self.is_better(current, self.best):
+            self.best = current
+            self.num_bad_epochs = 0
+        else:
+            self.num_bad_epochs += 1
+
+        if self.in_cooldown:
+            self.cooldown_counter -= 1
+            self.num_bad_epochs = 0  # ignore any bad epochs in cooldown
+
+        if self.num_bad_epochs > self.patience:
+            self._reduce_lr(self.last_epoch)
+            self.cooldown_counter = self.cooldown
+            self.num_bad_epochs = 0
+        elif self.num_bad_epochs == 0:
+            self._increase_lr(self.last_epoch)
+
+        return self.get_last_lr()
+
+    def _reduce_lr(self, epoch):
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            old_lr = float(param_group['lr'])
+            new_lr = max(old_lr * self.factor, self.min_lr)
+            if old_lr - new_lr > self.threshold:
+                param_group['lr'] = new_lr
+                if self.verbose:
+                    print(f'Epoch {epoch}: reducing learning rate of group {i} to {new_lr:.4e}.')
+
+    def _increase_lr(self, epoch):
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            old_lr = float(param_group['lr'])
+            new_lr = min(old_lr * self.increase_factor, self.max_lr)
+            if new_lr - old_lr > self.threshold:
+                param_group['lr'] = new_lr
+                if self.verbose:
+                    print(f'Epoch {epoch}: increasing learning rate of group {i} to {new_lr:.4e}.')
+
+    @property
+    def in_cooldown(self):
+        return self.cooldown_counter > 0
+
+    def is_better(self, a, best):
+        if self.mode == 'min' and self.threshold_mode == 'rel':
+            rel_epsilon = 1. - self.threshold
+            return a < best * rel_epsilon
+        elif self.mode == 'min' and self.threshold_mode == 'abs':
+            return a < best - self.threshold
+        elif self.mode == 'max' and self.threshold_mode == 'rel':
+            rel_epsilon = self.threshold + 1.
+            return a > best * rel_epsilon
+        else:  # mode == 'max' and epsilon_mode == 'abs':
+            return a > best + self.threshold
+
+    def _init_is_better(self, mode, threshold, threshold_mode):
+        if mode not in {'min', 'max'}:
+            raise ValueError('mode ' + mode + ' is unknown!')
+        if threshold_mode not in {'rel', 'abs'}:
+            raise ValueError('threshold mode ' + threshold_mode + ' is unknown!')
+
+        if mode == 'min':
+            self.mode_worse = float('inf')
+        else:  # mode == 'max':
+            self.mode_worse = -float('inf')
+
+        self.mode = mode
+        self.threshold = threshold
+        self.threshold_mode = threshold_mode
 
 class AdaptiveEarlyStopping:
     def __init__(self, patience=20, modification_delay=10):

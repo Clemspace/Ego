@@ -8,7 +8,7 @@ from data_utils import ARCDataset, ARCTask
 from utils import get_device, print_cuda_info
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
-from ego import SelfAdaptingModificationScheduler, SelfModifyingNetwork, AdaptiveEarlyStopping
+from ego import SelfAdaptingModificationScheduler, SelfModifyingNetwork, AdaptiveEarlyStopping, AdaptiveLRScheduler
 import copy
 
 
@@ -55,7 +55,9 @@ def train_and_evaluate(model, train_tasks, eval_tasks, epochs):
     device = get_device()
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = AdaptiveLRScheduler(optimizer, mode='min', factor=0.5, patience=5, 
+                                    threshold=1e-4, threshold_mode='rel', cooldown=0, 
+                                    min_lr=1e-6, max_lr=1e-2, increase_factor=1.2, verbose=True)
     modification_scheduler = SelfAdaptingModificationScheduler(model, initial_frequency=0.1, min_frequency=0.01, max_frequency=0.2)
     early_stopping = AdaptiveEarlyStopping(patience=20, modification_delay=20)
 
@@ -151,7 +153,6 @@ def train_and_evaluate(model, train_tasks, eval_tasks, epochs):
                 print(f"- {mod}")
         if old_lr != new_lr:
             print(f"Learning rate changed: {old_lr:.6f} -> {new_lr:.6f}")
-        print("-" * 50)
         
         # wandb logging
         wandb.log({
@@ -165,6 +166,7 @@ def train_and_evaluate(model, train_tasks, eval_tasks, epochs):
             'total_modifications': stats['modifications'],
             'parameter_count': stats['parameters'],
             'learning_rate': new_lr,
+            'lr_change': (new_lr - old_lr) / old_lr,  # Percentage change in learning rate
             'model_size_mb': model.get_model_size(),
             'num_encoder_layers': len(model.encoder),
             'num_decoder_layers': len(model.decoder),
