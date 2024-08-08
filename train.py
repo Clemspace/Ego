@@ -35,7 +35,8 @@ def train_model(model, train_dataset, eval_dataset, epochs=1000, modify_every=10
         "epochs": epochs,
         "modify_every": modify_every,
         "device": device.type,
-        "initial_lr": initial_lr
+        "initial_lr": initial_lr,
+        "initial_param_count": model.count_parameters()
     })
     
     wandb.watch(model, log="all", log_freq=100)
@@ -145,6 +146,7 @@ def train_model(model, train_dataset, eval_dataset, epochs=1000, modify_every=10
         print("Train Completion Rates:", avg_train_completion_rates)
         print("Eval Completion Rates:", avg_eval_completion_rates)
         print(f"Current learning rate: {current_lr}")
+        print(f"Current parameter count: {model.count_parameters()}")
 
         wandb.log({
             "epoch": epoch + 1,
@@ -152,6 +154,7 @@ def train_model(model, train_dataset, eval_dataset, epochs=1000, modify_every=10
             "eval_loss": avg_eval_loss,
             "learning_rate": current_lr,
             "gradient_norm": total_norm,
+            "parameter_count": model.count_parameters(),
             **{f"train_{k}": v for k, v in avg_train_completion_rates.items()},
             **{f"eval_{k}": v for k, v in avg_eval_completion_rates.items()}
         })
@@ -162,6 +165,11 @@ def train_model(model, train_dataset, eval_dataset, epochs=1000, modify_every=10
             # Update the optimizer's learning rate
             for param_group in optimizer.param_groups:
                 param_group['lr'] = model.learning_rate.item()
+            
+            # Log parameter count changes
+            if model.param_count_history:
+                param_count_change = model.param_count_history[-1] - model.param_count_history[-2]
+                wandb.log({"parameter_count_change": param_count_change})
         
         if avg_eval_loss < best_eval_loss:
             best_eval_loss = avg_eval_loss

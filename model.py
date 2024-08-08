@@ -72,9 +72,11 @@ class SelfModifyingNetwork(nn.Module):
         self.size_weight = nn.Parameter(torch.tensor(1.0))
         self.lr_adjustment_factor = nn.Parameter(torch.tensor(1.0))
         
+
         self.performance_history = []
         self.modification_history = []
         self.feedback_factor = 1.0
+        self.param_count_history = []
         self.init_weights()
 
     def init_weights(self):
@@ -161,32 +163,56 @@ class SelfModifyingNetwork(nn.Module):
             else:
                 self.feedback_factor = max(0.5, self.feedback_factor * 0.9)
 
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
     def _modify_architecture(self):
         modifications = []
+        current_param_count = self.count_parameters()
+        
+        # Analyze recent performance trend
+        if len(self.performance_history) >= 5:
+            recent_trend = sum(self.performance_history[-5:]) / 5
+            long_term_trend = sum(self.performance_history) / len(self.performance_history)
+            
+            if recent_trend < long_term_trend:  # Performance is improving
+                target_param_count = int(current_param_count * 1.1)  # Increase by 10%
+            else:  # Performance is stagnating or worsening
+                target_param_count = int(current_param_count * 0.9)  # Decrease by 10%
+        else:
+            target_param_count = current_param_count  # Not enough history, maintain current size
+        
         for module_list in [self.encoder, self.decoder[:-1]]:
             for i, layer in enumerate(module_list):
                 if isinstance(layer, DynamicLayer) and torch.rand(1).item() < self.modification_rate:
-                    change_factor = 1 + (torch.rand(1).item() - 0.5) * 0.1
-                    new_size = max(8, int(layer.conv.out_channels * change_factor))
-                    new_size = new_size - (new_size % 8)
-                    new_layer = DynamicLayer(layer.conv.in_channels, new_size)
-                    with torch.no_grad():
-                        min_channels = min(layer.conv.out_channels, new_size)
-                        new_layer.conv.weight[:min_channels] = layer.conv.weight[:min_channels]
-                        new_layer.conv.bias[:min_channels] = layer.conv.bias[:min_channels]
-                    module_list[i] = new_layer
+                    current_size = layer.conv.out_channels
+                    if self.count_parameters() < target_param_count:
+                        new_size = min(current_size * 2, current_size + 64)  # Increase, but not more than double
+                    else:
+                        new_size = max(current_size // 2, current_size - 64, 8)  # Decrease, but not less than half or 8
                     
-                    # Update the next layer's input channels
-                    if i < len(module_list) - 1:
-                        next_layer = module_list[i+1]
-                        if isinstance(next_layer, DynamicLayer):
-                            next_layer.conv = nn.Conv2d(new_size, next_layer.conv.out_channels, 
-                                                        kernel_size=next_layer.conv.kernel_size, 
-                                                        padding=next_layer.conv.padding)
-                            nn.init.kaiming_normal_(next_layer.conv.weight, mode='fan_out', nonlinearity='relu')
-                            nn.init.zeros_(next_layer.conv.bias)
-                    
-                    modifications.append(f"Modified layer size: {layer.conv.out_channels} -> {new_size}")
+                    new_size = new_size - (new_size % 8)  # Ensure it's divisible by 8
+                    if new_size != current_size:
+                        new_layer = DynamicLayer(layer.conv.in_channels, new_size)
+                        with torch.no_grad():
+                            min_channels = min(current_size, new_size)
+                            new_layer.conv.weight[:min_channels] = layer.conv.weight[:min_channels]
+                            new_layer.conv.bias[:min_channels] = layer.conv.bias[:min_channels]
+                        module_list[i] = new_layer
+                        
+                        # Update the next layer's input channels
+                        if i < len(module_list) - 1:
+                            next_layer = module_list[i+1]
+                            if isinstance(next_layer, DynamicLayer):
+                                next_layer.conv = nn.Conv2d(new_size, next_layer.conv.out_channels, 
+                                                            kernel_size=next_layer.conv.kernel_size, 
+                                                            padding=next_layer.conv.padding)
+                                nn.init.kaiming_normal_(next_layer.conv.weight, mode='fan_out', nonlinearity='relu')
+                                nn.init.zeros_(next_layer.conv.bias)
+                        
+                        modifications.append(f"Modified layer size: {current_size} -> {new_size}")
+        
+        self.param_count_history.append(self.count_parameters())
         return modifications
 
     def get_architecture_summary(self):
