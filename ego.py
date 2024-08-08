@@ -153,9 +153,14 @@ class ArchitectureModificationPredictor(nn.Module):
         self.fc = nn.Linear(hidden_size, num_modifications)
         
     def forward(self, x):
-        # x shape: (batch_size, sequence_length, input_features)
         _, (h_n, _) = self.lstm(x)
-        return self.fc(h_n[-1])  # Use the last hidden state
+        return self.fc(h_n[-1])
+
+    def to(self, device):
+        super().to(device)
+        self.lstm.to(device)
+        self.fc.to(device)
+        return self
     
 class AdaptiveModificationScheduler:
     def __init__(self, base_frequency=0.1, max_frequency=0.5, sensitivity=10):
@@ -169,96 +174,86 @@ class AdaptiveModificationScheduler:
             1 - math.exp(-self.sensitivity * loss_gap)
         )
         return min(probability, self.max_frequency)
+
 class SelfAdaptingModificationScheduler:
-    def __init__(self, model, initial_frequency=0.1, min_frequency=0.01, max_frequency=0.3, 
-                 initial_cooldown=10, min_cooldown=5, max_cooldown=30,
-                 initial_threshold=0.05, min_threshold=0.01, max_threshold=0.2,
-                 performance_window=50):
+    def __init__(self, model, initial_frequency=0.1, min_frequency=0.01, max_frequency=0.5, 
+                 cooldown_period=5, performance_window=20, gap_threshold=0.5):
         self.model = model
         self.current_frequency = initial_frequency
         self.min_frequency = min_frequency
         self.max_frequency = max_frequency
-        
-        self.current_cooldown = initial_cooldown
-        self.min_cooldown = min_cooldown
-        self.max_cooldown = max_cooldown
-        
-        self.current_threshold = initial_threshold
-        self.min_threshold = min_threshold
-        self.max_threshold = max_threshold
-        
+        self.cooldown_period = cooldown_period
         self.performance_window = performance_window
-        self.performance_history = deque(maxlen=performance_window)
-        self.modification_history = deque(maxlen=performance_window)
+        self.gap_threshold = gap_threshold
         
-        self.last_modification_epoch = 0
+        self.train_loss_history = []
+        self.eval_loss_history = []
+        self.modification_history = []
+        self.last_modification_epoch = -1
         self.epoch = 0
 
     def should_modify(self):
-        if self.epoch - self.last_modification_epoch < self.current_cooldown:
+        if self.epoch - self.last_modification_epoch < self.cooldown_period:
             return False
-        return random.random() < self.current_frequency
+        return np.random.random() < self.current_frequency
 
-    def update(self, current_performance):
+    def update(self, train_loss, eval_loss):
         self.epoch += 1
-        self.performance_history.append(current_performance)
+        self.train_loss_history.append(train_loss)
+        self.eval_loss_history.append(eval_loss)
         
-        if len(self.performance_history) > 1:
-            self._adapt_parameters()
+        if len(self.train_loss_history) > self.performance_window:
+            self.train_loss_history.pop(0)
+            self.eval_loss_history.pop(0)
+            self._adapt_frequency()
 
     def record_modification(self):
         self.last_modification_epoch = self.epoch
         self.modification_history.append(self.epoch)
 
-    def _adapt_parameters(self):
-        recent_performance = list(self.performance_history)[-10:]
-        overall_performance = list(self.performance_history)
+    def _adapt_frequency(self):
+        if len(self.train_loss_history) < 2:
+            return
+
+        recent_train_loss = np.mean(self.train_loss_history[-5:])
+        recent_eval_loss = np.mean(self.eval_loss_history[-5:])
+        recent_gap = recent_eval_loss - recent_train_loss
+
+        previous_train_loss = np.mean(self.train_loss_history[:-5])
+        previous_eval_loss = np.mean(self.eval_loss_history[:-5])
+        previous_gap = previous_eval_loss - previous_train_loss
+
+        gap_change = recent_gap - previous_gap
+
+        if gap_change > self.gap_threshold:
+            # Gap is growing, increase modification frequency
+            self.current_frequency = min(self.current_frequency * 1.1, self.max_frequency)
+        elif gap_change < -self.gap_threshold:
+            # Gap is shrinking, decrease modification frequency
+            self.current_frequency = max(self.current_frequency * 0.9, self.min_frequency)
         
-        recent_trend = np.mean(recent_performance)
-        overall_trend = np.mean(overall_performance)
-        
-        # Calculate rate of change
-        rate_of_change = (recent_performance[-1] - recent_performance[0]) / len(recent_performance)
-        
-        # Adapt frequency
-        if recent_trend < overall_trend and rate_of_change < 0:
-            self.current_frequency = min(self.current_frequency * 1.05, self.max_frequency)
-        elif recent_trend > overall_trend and rate_of_change > self.current_threshold:
-            self.current_frequency = max(self.current_frequency * 0.95, self.min_frequency)
-        
-        # Adapt cooldown period
-        if len(self.modification_history) > 1:
-            avg_modification_interval = np.mean(np.diff(self.modification_history))
-            if avg_modification_interval < self.current_cooldown:
-                self.current_cooldown = min(self.current_cooldown + 1, self.max_cooldown)
-            else:
-                self.current_cooldown = max(self.current_cooldown - 1, self.min_cooldown)
-        
-        # Adapt threshold
-        if abs(rate_of_change) > self.current_threshold:
-            self.current_threshold = min(self.current_threshold * 1.05, self.max_threshold)
-        else:
-            self.current_threshold = max(self.current_threshold * 0.95, self.min_threshold)
+        # Additional logic to prevent frequency from getting stuck at extremes
+        if self.current_frequency == self.max_frequency and gap_change <= 0:
+            self.current_frequency *= 0.95
+        elif self.current_frequency == self.min_frequency and gap_change >= 0:
+            self.current_frequency *= 1.05
 
     def get_stats(self):
         return {
             'frequency': self.current_frequency,
-            'cooldown': self.current_cooldown,
-            'threshold': self.current_threshold,
+            'cooldown': self.cooldown_period,
             'modifications': len(self.modification_history),
-            'parameters': self.count_parameters()
+            'parameters': self.model.count_parameters() if hasattr(self.model, 'count_parameters') else sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         }
-
-    def count_parameters(self):
-        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
 
 class SelfModifyingNetwork(nn.Module):
-    def __init__(self, input_channels=10, initial_hidden_channels=[64, 128], max_size_mb=50,
+    def __init__(self, input_channels=10, initial_hidden_channels=[64, 128], max_size_mb=100,
                  enable_layer_addition=True, enable_activation_modification=True, 
-                 enable_forward_modification=True):
+                 enable_forward_modification=True, device='cuda'):
         super(SelfModifyingNetwork, self).__init__()
         self._max_size_mb = max_size_mb
+        self.device = device
 
         self.enable_layer_addition = enable_layer_addition
         self.enable_activation_modification = enable_activation_modification
@@ -292,15 +287,16 @@ class SelfModifyingNetwork(nn.Module):
         self.performance_history = []
 
         # New components for intelligent modification
-        self.modification_predictor = ArchitectureModificationPredictor()
+        self.modification_predictor = ArchitectureModificationPredictor().to(self.device)
         self.modification_scheduler = AdaptiveModificationScheduler()
+        self.to(self.device)
 
     def create_conv_block(self, in_channels, out_channels):
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             self.activations[self.current_activation]
-        )
+        ).to(self.device) 
 
     @property
     def max_size_mb(self):
@@ -309,6 +305,8 @@ class SelfModifyingNetwork(nn.Module):
     def forward(self, x):
         original_size = (x.shape[1], x.shape[2])
         
+        x = x.to(self.device)
+
         x = self.onehot(x.long())
         x = x.permute(0, 3, 1, 2).float()
         
@@ -339,7 +337,7 @@ class SelfModifyingNetwork(nn.Module):
 
         # Use the modification predictor to decide which modification to make
         with torch.no_grad():
-            performance_metrics = torch.tensor([train_loss, eval_loss, self.get_model_size(), len(self.encoder), len(self.decoder)]).unsqueeze(0).unsqueeze(0)
+            performance_metrics = torch.tensor([train_loss, eval_loss, self.get_model_size(), len(self.encoder), len(self.decoder)]).unsqueeze(0).unsqueeze(0).to(self.device)
             modification_scores = self.modification_predictor(performance_metrics)
             modification_type = torch.argmax(modification_scores).item()
 
@@ -387,7 +385,15 @@ class SelfModifyingNetwork(nn.Module):
                 modifications.append("Reverted last modification due to size limit")
 
         self.modification_history.append((modification_type, modifications))
+        
+        if modifications:
+            self.to(self.device)  # Move all parameters to the device after modifications
+            
         return modifications
+    
+    def to(self, device):
+        self.device = device
+        return super().to(device)
 
     def get_model_size(self):
         param_size = sum(p.nelement() * p.element_size() for p in self.parameters())

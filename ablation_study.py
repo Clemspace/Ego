@@ -33,11 +33,13 @@ def load_arc_data(challenge_file, solution_file=None):
     return tasks
 
 
-def run_ablation_study(model_class, train_dataset, eval_dataset, base_config, features_to_ablate, epochs=100):
+def run_ablation_study(model_class, train_dataset, eval_dataset, base_config, features_to_ablate, epochs=1000):
     results = {}
+    device = get_device()
     
     # Run baseline model
-    baseline_model = model_class(**base_config)
+    base_config['device'] = device
+    baseline_model = model_class(**base_config).to(device)
     baseline_performance = train_and_evaluate(baseline_model, train_dataset, eval_dataset, epochs)
     results['baseline'] = baseline_performance
     
@@ -45,7 +47,7 @@ def run_ablation_study(model_class, train_dataset, eval_dataset, base_config, fe
     for feature in features_to_ablate:
         ablated_config = base_config.copy()
         ablated_config[feature] = False
-        ablated_model = model_class(**ablated_config)
+        ablated_model = model_class(**ablated_config).to(device)
         ablated_performance = train_and_evaluate(ablated_model, train_dataset, eval_dataset, epochs)
         results[f'ablated_{feature}'] = ablated_performance
     
@@ -58,13 +60,14 @@ def train_and_evaluate(model, train_tasks, eval_tasks, epochs):
     scheduler = AdaptiveLRScheduler(optimizer, mode='min', factor=0.5, patience=5, 
                                     threshold=1e-4, threshold_mode='rel', cooldown=0, 
                                     min_lr=1e-6, max_lr=1e-2, increase_factor=1.2, verbose=True)
-    modification_scheduler = SelfAdaptingModificationScheduler(model, initial_frequency=0.1, min_frequency=0.01, max_frequency=0.2)
-    early_stopping = AdaptiveEarlyStopping(patience=20, modification_delay=20)
+    modification_scheduler = SelfAdaptingModificationScheduler(model, initial_frequency=0.1, min_frequency=0.01, max_frequency=0.5)
+    early_stopping = AdaptiveEarlyStopping(patience=100, modification_delay=20)
 
     best_eval_loss = float('inf')
     best_model = None
     
     for epoch in range(epochs):
+        modifications = []  # Initialize modifications at the start of each epoch
         model.train()
         total_train_loss = 0
         num_train_samples = 0
@@ -131,51 +134,49 @@ def train_and_evaluate(model, train_tasks, eval_tasks, epochs):
         scheduler.step(avg_eval_loss)
         new_lr = optimizer.param_groups[0]['lr']
         
-        modification_scheduler.update(avg_eval_loss)
+        modification_scheduler.update(avg_train_loss, avg_eval_loss)
         
         if modification_scheduler.should_modify():
             modifications = model.modify(avg_train_loss, avg_eval_loss)
-        else:
-            modifications = []
+            if modifications:
+                print(f"Epoch {epoch+1}: Model modifications:")
+                for mod in modifications:
+                    print(f"  - {mod}")
+                modification_scheduler.record_modification()
+                
+                # Re-create optimizer and scheduler after modifications
+                optimizer = torch.optim.Adam(model.parameters(), lr=new_lr, weight_decay=1e-5)
+                scheduler = AdaptiveLRScheduler(optimizer, mode='min', factor=0.5, patience=5, 
+                                                threshold=1e-4, threshold_mode='rel', cooldown=0, 
+                                                min_lr=1e-6, max_lr=1e-2, increase_factor=1.2, verbose=True)
 
-        should_stop, best_model = early_stopping(model, epoch, avg_eval_loss, modifications)
-        
         stats = modification_scheduler.get_stats()
-        
-        # Terminal logging
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"Train Loss: {avg_train_loss:.4f}, Eval Loss: {avg_eval_loss:.4f}, Accuracy: {accuracy:.4f}")
         print(f"Modification Frequency: {stats['frequency']:.4f}, Parameters: {stats['parameters']}")
         print(f"Learning Rate: {new_lr:.6f}")
-        if modifications:
-            print("Modifications made:")
-            for mod in modifications:
-                print(f"- {mod}")
         if old_lr != new_lr:
             print(f"Learning rate changed: {old_lr:.6f} -> {new_lr:.6f}")
+        print("-" * 50)
         
-        # wandb logging
         wandb.log({
             'epoch': epoch,
             'train_loss': avg_train_loss,
             'eval_loss': avg_eval_loss,
+            'loss_gap': avg_eval_loss - avg_train_loss,
             'accuracy': accuracy,
             'modification_frequency': stats['frequency'],
-            'cooldown_period': stats['cooldown'],
-            'modification_threshold': stats['threshold'],
             'total_modifications': stats['modifications'],
             'parameter_count': stats['parameters'],
             'learning_rate': new_lr,
-            'lr_change': (new_lr - old_lr) / old_lr,  # Percentage change in learning rate
-            'model_size_mb': model.get_model_size(),
-            'num_encoder_layers': len(model.encoder),
-            'num_decoder_layers': len(model.decoder),
-            'current_activation': model.current_activation,
+            'lr_change': (new_lr - old_lr) / old_lr,
         })
         
         if modifications:
-            wandb.log({f'modification_{i}': mod for i, mod in enumerate(modifications)})
-        
+            for i, mod in enumerate(modifications):
+                wandb.log({f'modification_{i}': mod})
+
+        should_stop, best_model = early_stopping(model, epoch, avg_eval_loss, modifications)
         if should_stop:
             print(f"Early stopping triggered after {epoch+1} epochs")
             break
@@ -199,7 +200,7 @@ def main():
     print_cuda_info()
     device = get_device()
     
-    base_path = r'C:\Users\Clemspace\Mistral\EGO\arc_challenge'
+    base_path = r'/root/projects/Ego/arc_challenge'
     train_challenge_file = os.path.join(base_path, 'arc-agi_training_challenges.json')
     train_solution_file = os.path.join(base_path, 'arc-agi_training_solutions.json')
     eval_challenge_file = os.path.join(base_path, 'arc-agi_evaluation_challenges.json')
@@ -215,7 +216,7 @@ def main():
     base_config = {
         'input_channels': 10,  # ARC typically uses values 0-9
         'initial_hidden_channels': [64, 128],
-        'max_size_mb': 50,
+        'max_size_mb': 100,
         'enable_layer_addition': True,
         'enable_activation_modification': True,
         'enable_forward_modification': True
